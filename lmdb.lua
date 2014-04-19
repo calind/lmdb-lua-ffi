@@ -9,7 +9,12 @@ _M._VERSION = "0.1-alpha"
 _M.READ_ONLY = false
 _M.WRITE = true
 
-local _txns = setmetatable({},{__mode = 'v'})
+local _envs = setmetatable({},{__mode = 'v'})
+
+local TXN_INITIAL = 1 -- initial transaction state
+local TXN_DONE = 2 -- the transaction has been commited or aborted, and we can dispose the handle
+local TXN_RESET = 3 -- the transaction was reset and can be resurected
+local TXN_DIRTY = 4 -- the transaction has uncommited changes
 
 local MDB_val_mt = {
     __tostring = function(self)
@@ -72,17 +77,13 @@ local db_mt = {
 
 local function env_close(env)
     if env then
-        lmdb.mdb_env_close(env)
-    end
-end
-
-local function txn_gc(txn)
-    if txn then
-        txn = _txns[tostring(txn)]
-        if txn and not txn['finished'] then
-            print('Force aborting of unfinished transaction ', txn._handle)
-            lmdb.mdb_txn_abort(txn._handle)
+        local env = _envs[tostring(env)]
+        for _,txn in pairs(env['txns']) do
+            if txn.state ~= TXN_DONE then
+                txn:abort()
+            end
         end
+        lmdb.mdb_env_close(env._handle)
     end
 end
 
@@ -162,6 +163,7 @@ function env.open(self, path, options)
     local txn, msg, rc = self:transaction(function(txn)
         db = self:db_open(nil,nil,txn)
     end,_M.READ_ONLY)
+    _envs[tostring(env)] = self
     return self
 end
 
@@ -260,7 +262,6 @@ function env.db_open(self, name, options, txn)
                 return nil, "Database was already opened with ".. k .."=" .. dbs[name].options[k] .. " but " .. v .. " was given", 10000 + 1
             end
         end
-        print(name .. ' from cache')
         return dbs[name]
     end
 
@@ -281,7 +282,6 @@ function env.db_open(self, name, options, txn)
     end
 
     if rc ~= 0 then
-        print(get_error(rc))
         return nil, get_error(rc), rc
     end
     local db = setmetatable({ _handle = dbi[0], options = options }, db_mt)
@@ -293,11 +293,11 @@ function env.transaction(self, callback, write, db)
     local txn, msg, rc = txn:begin(self, write, db)
     if not txn then return nil, msg, rc end
     callback(txn)
-    if write and not txn.finished then
+    if write and not txn.state ~= TXN_DONE then
         local result, msg, rc = txn:commit()
         if not result then return txn, msg, rc end
     end
-    if not write and not txn.finished then
+    if not write and txn.state ~= TXN_DONE then
         txn:reset()
     end
     return txn
@@ -315,14 +315,17 @@ function txn.begin(self, env, write, db)
     end
     txn = txn[0]
     -- ffi.gc(txn,txn_gc)
-    txn = setmetatable({ _handle = txn, read_only = (not write), env = env, db = db or env.dbs[0] }, txn_mt)
+    txn = setmetatable({ _handle = txn,
+                         read_only = (not write),
+                         env = env,
+                         db = db or env.dbs[0],
+                         state=TXN_INITIAL }, txn_mt)
     table.insert(env['txns'], txn)
-    _txns[tostring(txn._handle)] = txn
     return txn
 end
 
 function txn.commit(self)
-    if self.finished then
+    if self.state == TXN_DONE then
         error("The transaction is finished.", 4)
     end
 
@@ -330,7 +333,7 @@ function txn.commit(self)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
-    self.finished = true
+    self.state = TXN_DONE
     return true
 end
 
@@ -344,31 +347,31 @@ function txn.reset(self)
     end
 
     lmdb.mdb_txn_reset(self._handle)
-    self.finished = true
-    self.reset = true
+    self.state = TXN_RESET
 end
 
 function txn.renew(self)
     if not self.read_only then
         error("Cannot renew a write transaction.", 4)
     end
+    if self._aborted then
+        error("Cannot renew an aborted transaction.", 4)
+    end
 
     local rc = lmdb.mdb_txn_renew(self._handle)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
-    self.finished = nil
-    self.reset = nil
+    self.state = TXN_INITIAL
     return true
 end
 
 function txn.abort(self)
-    if self.finished then
+    if self.finished and not self._reset then
         return
     end
     lmdb.mdb_txn_abort(self._handle)
-    self.finished = true
-    self.aborted = true
+    self.state = TXN_DONE
 end
 
 function txn.put(self, key, value, options, db)
@@ -403,6 +406,7 @@ function txn.put(self, key, value, options, db)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
+    self.state = TXN_DIRTY
     return true
 end
 
@@ -438,6 +442,7 @@ function txn.del(self, key, data, db)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
+    self.state = TXN_DIRTY
     return true
 end
 
@@ -456,7 +461,7 @@ function txn.stat(self, db)
         branch_pages = tonumber(stat.ms_branch_pages),
         leaf_pages = tonumber(stat.ms_leaf_pages),
         overflow_pages = tonumber(stat.ms_overflow_pages),
-        entries = tonumber(stat.ms_entries)
+        entries = tonumber(stat.ms_entries),
     }
 end
 
