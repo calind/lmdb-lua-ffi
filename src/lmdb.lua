@@ -402,7 +402,7 @@ function txn.put(self, key, value, options, db)
     if not options.overwrite then flags = bit.bor(flags, lmdb.MDB_NOOVERWRITE) end
     if options.append then flags = bit.bor(flags, lmdb.MDB_APPEND) end
 
-    local rc = lmdb.mdb_put(self._handle,db._handle,MDB_val(key,true),MDB_val(key,true), flags)
+    local rc = lmdb.mdb_put(self._handle,db._handle,MDB_val(key,true),MDB_val(value,true), flags)
     if rc == lmdb.MDB_KEYEXIST then
         return nil
     end
@@ -429,7 +429,7 @@ function txn.get(self, key, db)
     return value
 end
 
-function txn.del(self, key, data, db)
+function txn.del(self, key, value, db)
     if self.finished then
         error("The transaction is finished.")
     end
@@ -439,7 +439,7 @@ function txn.del(self, key, data, db)
 
     local db = db or self.env.dbs[0]
 
-    if data then data = MDB_val(data) end
+    if value then value = MDB_val(value) end
 
     local rc = lmdb.mdb_del(self._handle, db._handle, MDB_val(key), value)
     if rc ~= 0 then
