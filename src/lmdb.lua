@@ -18,6 +18,7 @@ local TXN_DIRTY = 4 -- the transaction has uncommited changes
 
 local MDB_val_mt = {
     __tostring = function(self)
+        if self.mv_size == 0 then return '' end
         return ffi.string(self.mv_data, self.mv_size)
     end,
     __len = function(self)
