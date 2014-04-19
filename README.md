@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/calind/lmdb-lua-ffi.svg?branch=master)](https://travis-ci.org/calind/lmdb-lua-ffi)
+
 lmdb-lua-ffi
 ============
 
