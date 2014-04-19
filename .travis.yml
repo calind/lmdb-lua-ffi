@@ -4,7 +4,7 @@ before_install:
   - sudo apt-get install -qq luajit luarocks
 install:
   - sudo luarocks install busted
-  - sed -i 's#/usr/bin/lua#$LUA#g' /usr/local/bin/busted
+  - sudo sed -i 's#/usr/bin/lua#$LUA#g' /usr/local/bin/busted
   - wget https://gitorious.org/mdb/mdb/archive/aa3463ec7c5e979420b13c8f37caa377ed2c1cf1.tar.gz -O/tmp/lmdb.tar.gz
   - cd /tmp ; tar -zxf /tmp/lmdb.tar.gz ; cd /tmp/mdb-mdb/libraries/liblmdb ; make ; sudo make install
 script: cd $TRAVIS_BUILD_DIR ; LUA=/usr/bin/luajit busted
