@@ -42,7 +42,7 @@ local function MDB_val(val, len)
         if len == true then
             buf = ffi.cast('void*',val)
         else
-            buf = ffi.new('uint8_t[?]',_len)
+            buf = ffi.new('char[?]',_len)
             ffi.copy(buf, val, _len)
         end
         len = _len
@@ -57,7 +57,7 @@ local function MDB_val(val, len)
         return val
     end
 
-    error("MDB_val must be initialized either with 'ctype<struct MDB_val>' or 'string' but '".. type(val) .. "' was given.",3)
+    error("MDB_val must be initialized either with 'ctype<struct MDB_val>' or 'string'",3)
 end
 
 local env = {}
@@ -76,6 +76,7 @@ local db_mt = {
 }
 
 local function env_close(env)
+    print('env',env)
     if env then
         local env = _envs[tostring(env)]
         for _,txn in pairs(env['txns']) do
@@ -347,7 +348,6 @@ function txn.reset(self)
     end
 
     lmdb.mdb_txn_reset(self._handle)
-    self.state = TXN_RESET
 end
 
 function txn.renew(self)
@@ -362,7 +362,8 @@ function txn.renew(self)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
-    self.state = TXN_INITIAL
+    self.finished = nil
+    self._reset = nil
     return true
 end
 
@@ -371,7 +372,8 @@ function txn.abort(self)
         return
     end
     lmdb.mdb_txn_abort(self._handle)
-    self.state = TXN_DONE
+    self.finished = true
+    self._aborted = true
 end
 
 function txn.put(self, key, value, options, db)
@@ -398,7 +400,7 @@ function txn.put(self, key, value, options, db)
     if not options.overwrite then flags = bit.bor(flags, lmdb.MDB_NOOVERWRITE) end
     if options.append then flags = bit.bor(flags, lmdb.MDB_APPEND) end
 
-    local rc = lmdb.mdb_put(self._handle,db._handle,MDB_val(key),MDB_val(key), flags)
+    local rc = lmdb.mdb_put(self._handle,db._handle,MDB_val(key,true),MDB_val(key,true), flags)
     if rc == lmdb.MDB_KEYEXIST then
         return nil
     end
@@ -406,7 +408,6 @@ function txn.put(self, key, value, options, db)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
-    self.state = TXN_DIRTY
     return true
 end
 
@@ -418,7 +419,7 @@ function txn.get(self, key, db)
     local db = db or self.env.dbs[0]
 
     local value = MDB_val()
-    local rc = lmdb.mdb_get(self._handle, db._handle, MDB_val(key), value)
+    local rc = lmdb.mdb_get(self._handle, db._handle, MDB_val(key,true), value)
     if rc == lmdb.MDB_NOTFOUND then return nil end
     if rc ~= 0 then
         return nil, get_error(rc), rc
@@ -442,7 +443,6 @@ function txn.del(self, key, data, db)
     if rc ~= 0 then
         return nil, get_error(rc), rc
     end
-    self.state = TXN_DIRTY
     return true
 end
 
@@ -461,7 +461,7 @@ function txn.stat(self, db)
         branch_pages = tonumber(stat.ms_branch_pages),
         leaf_pages = tonumber(stat.ms_leaf_pages),
         overflow_pages = tonumber(stat.ms_overflow_pages),
-        entries = tonumber(stat.ms_entries),
+        entries = tonumber(stat.ms_entries)
     }
 end
 
