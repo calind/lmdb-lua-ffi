@@ -4,7 +4,6 @@ before_install:
 install:
   - sudo luarocks install busted
   - wget https://gitorious.org/mdb/mdb/archive/aa3463ec7c5e979420b13c8f37caa377ed2c1cf1.tar.gz -O/tmp/lmdb.tar.gz
-  - cd /tmp ; tar -zxf /tmp/lmdb.tar.gz ; ls -laR /tmp ; cd /tmp/lmdb/liblmdb ; make ; sudo make install
-  - which busted
-script:
-  - busted
+  - cd /tmp ; tar -zxf /tmp/lmdb.tar.gz ; cd /tmp/mdb-mdb/libraries/liblmdb ; make ; sudo make install
+  - cat $(which busted)
+script: LUA=luajit busted
