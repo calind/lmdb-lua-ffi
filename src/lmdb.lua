@@ -77,14 +77,15 @@ local db_mt = {
 }
 
 local function env_close(env)
-    print('env',env)
+    local env_key = tostring(env)
+    local env = _envs[env_key]
     if env then
-        local env = _envs[tostring(env)]
         for _,txn in pairs(env['txns']) do
             if txn.state ~= TXN_DONE then
                 txn:abort()
             end
         end
+        _envs[env_key] = nil
         lmdb.mdb_env_close(env._handle)
     end
 end
@@ -198,7 +199,7 @@ function env.stat(self)
 end
 
 function env.close(self)
-    env_close(self._handler)
+    env_close(self._handle)
 end
 
 function env.sync(self, force)
