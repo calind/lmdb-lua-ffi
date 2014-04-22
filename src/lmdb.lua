@@ -1,21 +1,30 @@
 local _ = require 'underscore'
 local bit = require 'bit'
-local ffi = require "ffi"
-local lmdb = require "lmdb_ffi"
-local utils = require 'utils'
+local dump = require 'utils'.dump
+local ffi = require 'ffi'
+local lmdb = require 'lmdb_ffi'
 
 _M = {}
-_M._VERSION = "0.1-alpha"
+_M._VERSION = '0.1-alpha'
 _M.READ_ONLY = false
 _M.WRITE = true
-
-local _envs = setmetatable({},{__mode = 'v'})
 
 local TXN_INITIAL = 1 -- initial transaction state
 local TXN_DONE = 2 -- the transaction has been commited or aborted, and we can dispose the handle
 local TXN_RESET = 3 -- the transaction was reset and can be resurected
 local TXN_DIRTY = 4 -- the transaction has uncommited changes
 
+-- store structures metadata in a wekreaf table
+local _data = setmetatable({},{__mode = 'k'})
+
+local function _error(code)
+    local msg = ffi.string(lmdb.mdb_strerror(code))
+    return nil, msg, code
+end
+
+--
+-- MDB_val magic
+--
 local MDB_val_mt = {
     __tostring = function(self)
         if self.mv_size == 0 then return '' end
@@ -61,40 +70,302 @@ local function MDB_val(val, len)
     error("MDB_val must be initialized either with 'ctype<struct MDB_val>' or 'string'",3)
 end
 
+--
+-- LMDB environment related functions
+--
+
 local env = {}
-local env_mt = {
-    __index = env,
-}
+function env:__index(k)
+    return env[k] or (_data[self] and _data[self][k] or nil)
+end
 
-local txn = {}
-local txn_mt = {
-    __index = txn,
-}
+function env:__gc()
+    print('Closing environment ' .. tostring(self))
+    lmdb.mdb_env_close(self)
+end
 
-local db = {}
-local db_mt = {
-    __index = db
-}
+function env:__newindex(k,v)
+    if not _data[self] then _data[self] = {} end
+    _data[self][k] = v
+end
 
-local function env_close(env)
-    local env_key = tostring(env)
-    local env = _envs[env_key]
-    if env then
-        for _,txn in pairs(env['txns']) do
-            if txn.state ~= TXN_DONE then
-                txn:abort()
+function env:info()
+    local info = ffi.new 'MDB_envinfo[1]'
+    lmdb.mdb_env_info(self, info)
+    info = info[0]
+    return {
+        map_addr = info.me_mapaddr,
+        map_size = tonumber(info.me_mapsize),
+        last_pgno = tonumber(info.me_last_pgno),
+        last_txnid = tonumber(info.me_last_txnid),
+        max_readers = tonumber(info.me_maxreaders),
+        num_readers = tonumber(info.me_numreaders)
+    }
+end
+
+function env:stat()
+    local stat = ffi.new 'MDB_stat[1]'
+    lmdb.mdb_env_stat(self, stat)
+    stat = stat[0]
+    return {
+        psize = tonumber(stat.ms_psize),
+        depth = tonumber(stat.ms_depth),
+        branch_pages = tonumber(stat.ms_branch_pages),
+        leaf_pages = tonumber(stat.ms_leaf_pages),
+        overflow_pages = tonumber(stat.ms_overflow_pages),
+        entries = tonumber(stat.ms_entries)
+    }
+end
+
+function env:sync(force)
+    local force = force or false
+    rc = lmdb.mdb_env_sync(self, force)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    return true
+end
+
+function env:reader_check()
+    local readers = ffi.new 'int[1]'
+    local rc = lmdb.mdb_reader_check(self._handle, readers)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    return readers[0]
+end
+
+function env:path()
+    local path = ffi.new 'const char*[1]'
+    local rc = lmdb.mdb_env_get_path(self, path)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    return ffi.string(path[0])
+end
+
+function env:copy(path)
+    assert(path, "You must suply a path to the environment")
+    local rc = lmdb.mdb_env_copy(self, path)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    return true
+end
+
+function env:db_open(name, options, txn)
+    local _options = {
+        reverse_keys = false,
+        dupsort = false,
+        create = true,
+        integer_keys = false
+    }
+    if options then
+        _options = _.extend(_options, options)
+    end
+    options = _options
+    local db =self.dbs[name or 0]
+    if db then
+        for k,v in pairs(options) do
+            if not db.options or db.options[k] ~= v then
+                return nil, "Database was already opened with ".. k .."=" .. tostring(db.options[k]) .. " but '" .. tostring(v) .. " was given", 10000 + 1
             end
         end
-        _envs[env_key] = nil
-        lmdb.mdb_env_close(env._handle)
+        return db[_handle]
     end
+
+    local flags = 0
+    if options.reverse_keys then flags = bit.bor(flags, lmdb.MDB_REVERSEKEY) end
+    if options.dupsort then flags = bit.bor(flags, lmdb.MDB_DUPSORT) end
+    if options.create then flags = bit.bor(flags, lmdb.MDB_CREATE) end
+    if options.integer_keys then flags = bit.bor(flags, lmdb.MDB_INTEGERKEY) end
+    local dbi = ffi.new 'MDB_dbi[1]'
+    local rc = 0
+
+    if txn then
+        rc = lmdb.mdb_dbi_open(txn,name,flags,dbi)
+    else
+        self:transaction(function(txn)
+            rc = lmdb.mdb_dbi_open(txn,name,flags,dbi)
+        end, not self.read_only)
+    end
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    self.dbs[name or 0] = { _handle = dbi[0], options = options }
+    return dbi[0]
 end
 
-local function get_error(code)
-    return ffi.string(lmdb.mdb_strerror(code))
+function env:transaction(callback, write, db)
+    if write and self.read_only then
+        error("Cannot start an write transaction on an read-only opened envrionment")
+    end
+    local flags = not write and lmdb.MDB_RDONLY or 0
+    local txn = ffi.new 'MDB_txn* [1]'
+    local rc = lmdb.mdb_txn_begin(self, nil, flags, txn)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    txn = txn[0]
+    txn.read_only = (not write)
+    txn.env = self
+    callback(txn)
+    if write and not txn.state ~= TXN_DONE then
+        local result, msg, rc = txn:commit()
+        if not result then return txn, msg, rc end
+    end
+    if not write and txn.state ~= TXN_DONE then
+        txn:reset()
+    end
+    return true
 end
 
-function env.open(self, path, options)
+
+local txn = {}
+function txn:__index(k)
+    return txn[k] or (_data[self] and _data[self][k] or nil)
+end
+
+function txn:__newindex(k,v)
+    if not _data[self] then _data[self] = {} end
+    _data[self][k] = v
+end
+
+function txn:commit()
+    if self.state == TXN_DONE then
+        error("The transaction is finished.", 4)
+    end
+    local rc = lmdb.mdb_txn_commit(self)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    self.state = TXN_DONE
+    return true
+end
+
+function txn:reset()
+    if not self.read_only then
+        error("Cannot reset a write transaction.", 4)
+    end
+
+    if self.state == TXN_DONE then
+        error("The transaction is finished.", 4)
+    end
+
+    lmdb.mdb_txn_reset(self)
+    self.state = TXN_RESET
+end
+
+function txn:renew()
+    if not self.read_only then
+        error("Cannot renew a write transaction.", 4)
+    end
+    if self._aborted then
+        error("Cannot renew an aborted transaction.", 4)
+    end
+
+    local rc = lmdb.mdb_txn_renew(self._handle)
+    if rc ~= 0 then
+        return nil, get_error(rc), rc
+    end
+    self.state = TXN_INITIAL
+    return true
+end
+
+function txn:abort()
+    if self.state == TXN_DONE then
+        return
+    end
+    lmdb.mdb_txn_abort(self._handle)
+    self.state = TXN_DONE
+end
+
+function txn:put(key, value, options, db)
+    if self.state == TXN_DONE then
+        error("The transaction is finished.")
+    end
+    if self.read_only then
+        error("Transaction is read only.")
+    end
+
+    local db = db or self.env.dbs[0]
+
+    local _options = {
+        dupdata = true,
+        overwrite = true,
+        append = false,
+    }
+    if options then
+        _options = _.extend(_options, options)
+    end
+    options = _options
+
+    local flags = 0
+    if not options.dupdata then flags = bit.bor(flags, lmdb.MDB_NODUPDATA) end
+    if not options.overwrite then flags = bit.bor(flags, lmdb.MDB_NOOVERWRITE) end
+    if options.append then flags = bit.bor(flags, lmdb.MDB_APPEND) end
+
+    local rc = lmdb.mdb_put(self,db._handle,MDB_val(key,true),MDB_val(value,true), flags)
+    if rc == lmdb.MDB_KEYEXIST then
+        return false
+    end
+
+    if rc ~= 0 then
+        return _error(rc)
+    end
+
+    self.state = TXN_DIRTY
+    return true
+end
+
+function txn:get(key, db)
+    if self.state == TXN_DONE or self.state == TXN_RESET then
+        error("The transaction is finished.")
+    end
+
+    local db = db or self.env.dbs[0]
+
+    local value = MDB_val()
+    local rc = lmdb.mdb_get(self, db._handle, MDB_val(key,true), value)
+    if rc == lmdb.MDB_NOTFOUND then return nil end
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    return value
+end
+
+function txn:del(key, value, db)
+    if self.state == TXN_DONE then
+        error("The transaction is finished.")
+    end
+    if self.read_only then
+        error("Transaction is read only.")
+    end
+
+    local db = db or self.env.dbs[0]
+
+    if value then value = MDB_val(value) end
+
+    local rc = lmdb.mdb_del(self, db._handle, MDB_val(key), value)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    self.state = TXN_DIRTY
+    return true
+end
+
+--
+-- Setup structures metatables
+--
+ffi.metatype('MDB_env', env)
+ffi.metatype('MDB_txn', txn)
+
+
+--
+-- Public Module Interface
+--
+function _M.environment(path, options)
+    assert(path, "You must suply a path to the environment")
     local _options = {
         -- FS options
         mode = 0644,
@@ -120,26 +391,27 @@ function env.open(self, path, options)
     local env, rc = ffi.new 'MDB_env *[1]', nil
     rc = lmdb.mdb_env_create(env)
     if rc ~= 0 then
-        return nil, 'Error creating environment' .. get_error(rc), rc
+        return _error(rc)
     end
-    env = ffi.gc(env[0], env_close)
+    env = env[0]
+    ffi.gc(env,env.__gc)
 
     -- Setup maximum nummber of readers
     rc = lmdb.mdb_env_set_maxreaders(env, options.max_readers)
     if rc ~= 0 then
-        return nil, "Error while setting the maxium number of readers: " .. get_error(rc), rc
+        return _error(rc)
     end
 
     -- Setup the maxium number of databases
     rc = lmdb.mdb_env_set_maxdbs(env, options.max_dbs)
     if rc ~= 0 then
-        return nil, "Error while setting the number of databases: " .. get_error(rc), rc
+        return _error(rc)
     end
 
     -- Setup the database size
     rc = lmdb.mdb_env_set_mapsize(env, options.size)
     if rc ~= 0 then
-        return nil, "Error while setting database size: " .. get_error(rc), rc
+        return _error(rc)
     end
 
     -- Setup initial flags
@@ -155,316 +427,16 @@ function env.open(self, path, options)
     -- Open the environment
     rc = lmdb.mdb_env_open(env, path, flags, tonumber(options['mode'],8))
     if rc ~= 0 then
-        return nil, 'Error opening environment' .. get_error(rc), rc
+        return _error(rc)
     end
-    local db = nil
-    self = setmetatable({_handle = env,
-                         read_only = options.read_only,
-                         dbs = {},
-                         txns = setmetatable({},{__mode = 'v'})
-                        }, env_mt)
-    local txn, msg, rc = self:transaction(function(txn)
-        db = self:db_open(nil,nil,txn)
+
+    env.read_only = options.read_only
+    env.dbs = {}
+    -- open and cache the default database
+    env:transaction(function(txn)
+        db = env:db_open(nil,nil,txn)
     end,_M.READ_ONLY)
-    _envs[tostring(env)] = self
-    return self
-end
-
-function env.info(self)
-    local info = ffi.new 'MDB_envinfo[1]'
-    lmdb.mdb_env_info(self._handle, info)
-    info = info[0]
-    return {
-        map_addr = info.me_mapaddr,
-        map_size = tonumber(info.me_mapsize),
-        last_pgno = tonumber(info.me_last_pgno),
-        last_txnid = tonumber(info.me_last_txnid),
-        max_readers = tonumber(info.me_maxreaders),
-        num_readers = tonumber(info.me_numreaders)
-    }
-end
-
-function env.stat(self)
-    local stat = ffi.new 'MDB_stat[1]'
-    lmdb.mdb_env_stat(self._handle, stat)
-    stat = stat[0]
-    return {
-        psize = tonumber(stat.ms_psize),
-        depth = tonumber(stat.ms_depth),
-        branch_pages = tonumber(stat.ms_branch_pages),
-        leaf_pages = tonumber(stat.ms_leaf_pages),
-        overflow_pages = tonumber(stat.ms_overflow_pages),
-        entries = tonumber(stat.ms_entries)
-    }
-end
-
-function env.close(self)
-    env_close(self._handle)
-end
-
-function env.sync(self, force)
-    local force = force or false
-    rc = lmdb.mdb_env_sync(self._handle, force)
-    if rc ~= 0 then
-        return nil, "Error while setting database size: " .. get_error(rc), rc
-    end
-    return true
-end
-
-function env.reader_check(self)
-    local readers = ffi.new 'int[1]'
-    local rc = lmdb.mdb_reader_check(self._handle, readers)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return readers[0]
-end
-
-function env.max_readers(self)
-    local readers = ffi.new 'int[1]'
-    local rc = lmdb.mdb_env_get_maxreaders(self._handle, readers)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return readers[0]
-end
-
-function env.path(self)
-    local path = ffi.new 'const char*[1]'
-    local rc = lmdb.mdb_env_get_path(self._handle, path)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return ffi.string(path[0])
-end
-
-function env.copy(self, path)
-    local rc = lmdb.mdb_env_copy(self._handle, path)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return true
-end
-
-function env.db_open(self, name, options, txn)
-    local _options = {
-        reverse_keys = false,
-        dupsort = false,
-        create = true,
-        integer_keys = false
-    }
-    if options then
-        _options = _.extend(_options, options)
-    end
-    options = _options
-
-    if self.dbs[name or 0] then
-        local dbs = self.dbs
-        for k,v in pairs(options) do
-            if dbs[name].options[k] ~= v then
-                return nil, "Database was already opened with ".. k .."=" .. dbs[name].options[k] .. " but " .. v .. " was given", 10000 + 1
-            end
-        end
-        return dbs[name]
-    end
-
-    local flags = 0
-    if options.reverse_keys then flags = bit.bor(flags, lmdb.MDB_REVERSEKEY) end
-    if options.dupsort then flags = bit.bor(flags, lmdb.MDB_DUPSORT) end
-    if options.create then flags = bit.bor(flags, lmdb.MDB_CREATE) end
-    if options.integer_keys then flags = bit.bor(flags, lmdb.MDB_INTEGERKEY) end
-    local dbi = ffi.new 'MDB_dbi[1]'
-    local rc = 0
-
-    if txn then
-        rc = lmdb.mdb_dbi_open(txn._handle,name,flags,dbi)
-    else
-        self:transaction(function(txn)
-            rc = lmdb.mdb_dbi_open(txn._handle,name,flags,dbi)
-        end, not self.read_only)
-    end
-
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    local db = setmetatable({ _handle = dbi[0], options = options }, db_mt)
-    self.dbs[name or 0] = db
-    return db
-end
-
-function env.transaction(self, callback, write, db)
-    local txn, msg, rc = txn:begin(self, write, db)
-    if not txn then return nil, msg, rc end
-    callback(txn)
-    if write and not txn.state ~= TXN_DONE then
-        local result, msg, rc = txn:commit()
-        if not result then return txn, msg, rc end
-    end
-    if not write and txn.state ~= TXN_DONE then
-        txn:reset()
-    end
-    return txn
-end
-
-function txn.begin(self, env, write, db)
-    if write and env.read_only then
-        error("Cannot start an write transaction on an read-only opened envrionment")
-    end
-    local flags = not write and lmdb.MDB_RDONLY or 0
-    local txn = ffi.new 'MDB_txn* [1]'
-    local rc = lmdb.mdb_txn_begin(env._handle, nil, flags, txn)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    txn = txn[0]
-    -- ffi.gc(txn,txn_gc)
-    txn = setmetatable({ _handle = txn,
-                         read_only = (not write),
-                         env = env,
-                         db = db or env.dbs[0],
-                         state=TXN_INITIAL }, txn_mt)
-    table.insert(env['txns'], txn)
-    return txn
-end
-
-function txn.commit(self)
-    if self.state == TXN_DONE then
-        error("The transaction is finished.", 4)
-    end
-
-    local rc = lmdb.mdb_txn_commit(self._handle)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    self.state = TXN_DONE
-    return true
-end
-
-function txn.reset(self)
-    if not self.read_only then
-        error("Cannot reset a write transaction.", 4)
-    end
-
-    if self.finished and not self.reset then
-        error("The transaction is finished.", 4)
-    end
-
-    lmdb.mdb_txn_reset(self._handle)
-end
-
-function txn.renew(self)
-    if not self.read_only then
-        error("Cannot renew a write transaction.", 4)
-    end
-    if self._aborted then
-        error("Cannot renew an aborted transaction.", 4)
-    end
-
-    local rc = lmdb.mdb_txn_renew(self._handle)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    self.finished = nil
-    self._reset = nil
-    return true
-end
-
-function txn.abort(self)
-    if self.finished and not self._reset then
-        return
-    end
-    lmdb.mdb_txn_abort(self._handle)
-    self.finished = true
-    self._aborted = true
-end
-
-function txn.put(self, key, value, options, db)
-    if self.finished then
-        error("The transaction is finished.")
-    end
-    if self.read_only then
-        error("Transaction is read only.")
-    end
-
-    local db = db or self.env.dbs[0]
-
-    local _options = {
-        dupdata = true,
-        overwrite = true,
-        append = false,
-    }
-    if options then
-        _options = _.extend(_options, options)
-    end
-    options = _options
-    local flags = 0
-    if not options.dupdata then flags = bit.bor(flags, lmdb.MDB_NODUPDATA) end
-    if not options.overwrite then flags = bit.bor(flags, lmdb.MDB_NOOVERWRITE) end
-    if options.append then flags = bit.bor(flags, lmdb.MDB_APPEND) end
-
-    local rc = lmdb.mdb_put(self._handle,db._handle,MDB_val(key,true),MDB_val(value,true), flags)
-    if rc == lmdb.MDB_KEYEXIST then
-        return nil
-    end
-
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return true
-end
-
-function txn.get(self, key, db)
-    if self.finished then
-        error("The transaction is finished.")
-    end
-
-    local db = db or self.env.dbs[0]
-
-    local value = MDB_val()
-    local rc = lmdb.mdb_get(self._handle, db._handle, MDB_val(key,true), value)
-    if rc == lmdb.MDB_NOTFOUND then return nil end
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return value
-end
-
-function txn.del(self, key, value, db)
-    if self.finished then
-        error("The transaction is finished.")
-    end
-    if self.read_only then
-        error("Transaction is read only.")
-    end
-
-    local db = db or self.env.dbs[0]
-
-    if value then value = MDB_val(value) end
-
-    local rc = lmdb.mdb_del(self._handle, db._handle, MDB_val(key), value)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    return true
-end
-
-function txn.stat(self, db)
-    local db = db or self.env.dbs[0]
-
-    local stat = ffi.new 'MDB_stat[1]'
-    local rc = lmdb.mdb_stat(self._handle, db._handle, stat)
-    if rc ~= 0 then
-        return nil, get_error(rc), rc
-    end
-    stat = stat[0]
-    return {
-        psize = tonumber(stat.ms_psize),
-        depth = tonumber(stat.ms_depth),
-        branch_pages = tonumber(stat.ms_branch_pages),
-        leaf_pages = tonumber(stat.ms_leaf_pages),
-        overflow_pages = tonumber(stat.ms_overflow_pages),
-        entries = tonumber(stat.ms_entries)
-    }
+    return env
 end
 
 function _M.version()
@@ -473,12 +445,5 @@ function _M.version()
     return ver, major[0], minor[0], patch[0]
 end
 
-function _M.get_error(code)
-    return code, get_error(code)
-end
-
-_M.env = env
-_M.txn = txn
-_M.db = db
-_M.MDB_val = MDB_val
+_M.data = _data
 return _M
