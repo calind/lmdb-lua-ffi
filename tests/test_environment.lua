@@ -7,12 +7,11 @@ describe("LMDB environment", function()
     local env, msg = nil
 
     before_each(function()
-        env, msg = lmdb.env:open(testdb, {subdir = false, max_dbs=8})
+        env, msg = lmdb.environment(testdb, {subdir = false, max_dbs=8})
     end)
 
     after_each(function()
         if env then
-            env:close()
             env = nil
             msg = nil
         end
@@ -29,10 +28,12 @@ describe("LMDB environment", function()
     end)
 
     it("check for read transaction", function()
-        local txn, msg = lmdb.txn:begin(env, lmdb.READ_ONLY)
+        local result, msg = env:transaction(function(txn)
+            assert.not_nil(txn)
+            assert.is_true(txn.read_only)
+        end, lmdb.READ_ONLY)
+        assert.not_nil(result)
         assert.is_nil(msg)
-        assert.not_nil(txn)
-        assert.is_true(txn.read_only)
     end)
 
     it("check database open", function()
