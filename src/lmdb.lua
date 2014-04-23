@@ -14,6 +14,9 @@ local TXN_DONE = 2 -- the transaction has been commited or aborted, and we can d
 local TXN_RESET = 3 -- the transaction was reset and can be resurected
 local TXN_DIRTY = 4 -- the transaction has uncommited changes
 
+local CUR_UNINITIALIZED = 1 -- cursor is uninitialized
+local CUR_INITIALIZED = 2 -- cursor is uninitialized
+
 -- store structures metadata in a wekreaf table
 local _data = setmetatable({},{__mode = 'k'})
 
@@ -36,7 +39,6 @@ local MDB_val_mt = {
 }
 
 local MDB_val_ct = ffi.metatype('MDB_val', MDB_val_mt)
-
 local function MDB_val(val, len)
     if val == nil and len == nil then
         return MDB_val_ct()
@@ -70,6 +72,12 @@ local function MDB_val(val, len)
     error("MDB_val must be initialized either with 'ctype<struct MDB_val>' or 'string'",3)
 end
 
+local function MDB_int_val(val)
+    local n = ffi.new('int32_t[1]',{ tonumber(val) })
+    return MDB_val_ct(4,n)
+end
+
+
 --
 -- LMDB environment related functions
 --
@@ -80,7 +88,6 @@ function env:__index(k)
 end
 
 function env:__gc()
-    print('Closing environment ' .. tostring(self))
     lmdb.mdb_env_close(self)
 end
 
@@ -160,6 +167,7 @@ function env:db_open(name, options, txn)
         create = true,
         integer_keys = false
     }
+    -- print(self.db)
     if options then
         _options = _.extend(_options, options)
     end
@@ -193,6 +201,7 @@ function env:db_open(name, options, txn)
         return _error(rc)
     end
     self.dbs[name or 0] = { _handle = dbi[0], options = options }
+    _data[dbi[0]] = options
     return dbi[0]
 end
 
@@ -207,7 +216,11 @@ function env:transaction(callback, write, db)
         return _error(rc)
     end
     txn = txn[0]
+    ffi.gc(txn, txn.__gc)
     txn.read_only = (not write)
+
+    txn.db = db or (self.dbs[0] and self.dbs[0]._handle or nil)
+
     txn.env = self
     callback(txn)
     if write and not txn.state ~= TXN_DONE then
@@ -229,6 +242,12 @@ end
 function txn:__newindex(k,v)
     if not _data[self] then _data[self] = {} end
     _data[self][k] = v
+end
+
+function txn:__gc()
+    if self.state ~= TXN_DONE then
+        self:abort()
+    end
 end
 
 function txn:commit()
@@ -287,8 +306,8 @@ function txn:put(key, value, options, db)
     if self.read_only then
         error("Transaction is read only.")
     end
-
-    local db = db or self.env.dbs[0]
+    local db = db or self.db
+    local db_options = _data[db]
 
     local _options = {
         dupdata = true,
@@ -305,7 +324,9 @@ function txn:put(key, value, options, db)
     if not options.overwrite then flags = bit.bor(flags, lmdb.MDB_NOOVERWRITE) end
     if options.append then flags = bit.bor(flags, lmdb.MDB_APPEND) end
 
-    local rc = lmdb.mdb_put(self,db._handle,MDB_val(key,true),MDB_val(value,true), flags)
+    local key = db_options.integer_keys and MDB_int_val(key) or MDB_val(key)
+    local value = MDB_val(value)
+    local rc = lmdb.mdb_put(self,db,key,value,flags)
     if rc == lmdb.MDB_KEYEXIST then
         return false
     end
@@ -323,10 +344,13 @@ function txn:get(key, db)
         error("The transaction is finished.")
     end
 
-    local db = db or self.env.dbs[0]
+    local db = db or self.db
+    local db_options = _data[db]
 
+    local key = db_options.integer_keys and MDB_int_val(key) or MDB_val(key)
     local value = MDB_val()
-    local rc = lmdb.mdb_get(self, db._handle, MDB_val(key,true), value)
+
+    local rc = lmdb.mdb_get(self, db, key, value)
     if rc == lmdb.MDB_NOTFOUND then return nil end
     if rc ~= 0 then
         return _error(rc)
@@ -342,11 +366,13 @@ function txn:del(key, value, db)
         error("Transaction is read only.")
     end
 
-    local db = db or self.env.dbs[0]
+    local db = db or self.db
+    local db_options = _data[db]
 
+    local key = db_options.integer_keys and MDB_int_val(key) or MDB_val(key)
     if value then value = MDB_val(value) end
 
-    local rc = lmdb.mdb_del(self, db._handle, MDB_val(key), value)
+    local rc = lmdb.mdb_del(self, db, key, value)
     if rc ~= 0 then
         return _error(rc)
     end
@@ -354,11 +380,61 @@ function txn:del(key, value, db)
     return true
 end
 
+function txn:cursor(db)
+    local cursor = ffi.new 'MDB_cursor *[1]';
+    local db = db or self.db
+    local db_options = _data[db]
+
+    local rc = lmdb.mdb_cursor_open(self, db, cursor)
+    if rc ~= 0 then
+        return _error(rc)
+    end
+    cursor = cursor[0]
+    cursor.state = CUR_UNINITIALIZED
+    cursor.db_options = db_options
+    return cursor
+end
+
+local cursor = {}
+function cursor:__index(k)
+    return cursor[k] or (_data[self] and _data[self][k] or nil)
+end
+
+function cursor:__newindex(k,v)
+    if not _data[self] then _data[self] = {} end
+    _data[self][k] = v
+end
+
+
+function cursor:iter()
+    local i = 0
+    return function()
+        i = i + 1
+        local key, value = MDB_val(), MDB_val()
+        local op = lmdb.MDB_NEXT
+        if self.state == CUR_UNINITIALIZED then
+            self.state = CUR_INITIALIZED
+            op = lmdb.MDB_FIRST
+        end
+        local rc = lmdb.mdb_cursor_get(self, key, value, op)
+        if rc == lmdb.MDB_NOTFOUND then return nil end
+        if rc ~= 0 then
+            error('cursor error')
+        end
+        if self.db_options.integer_keys then
+            local key = ffi.cast('int32_t *', key.mv_data)
+            return tonumber(key[0]), value
+        end
+        return tostring(key), value
+    end
+end
+
 --
 -- Setup structures metatables
 --
 ffi.metatype('MDB_env', env)
 ffi.metatype('MDB_txn', txn)
+ffi.metatype('MDB_cursor', cursor)
 
 
 --
