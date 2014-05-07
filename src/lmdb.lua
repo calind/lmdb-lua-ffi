@@ -16,6 +16,7 @@ local TXN_DIRTY = 4 -- the transaction has uncommited changes
 
 local CUR_UNINITIALIZED = 1 -- cursor is uninitialized
 local CUR_INITIALIZED = 2 -- cursor is uninitialized
+local CUR_SEEKED = 3 -- cursor is seeked to an element from which the iteration starts
 
 -- store structures metadata in a wekreaf table
 local _data = setmetatable({},{__mode = 'k'})
@@ -428,6 +429,9 @@ function cursor:iter(options)
             if options.reverse then
                 op = lmdb.MDB_LAST
             end
+        elseif self.state == CUR_SEEKED then
+            op = lmdb.MDB_GET_CURRENT
+            self.state = CUR_INITIALIZED
         end
 
         local rc = lmdb.mdb_cursor_get(self, key, value, op)
@@ -456,7 +460,7 @@ function cursor:seek(key, range)
     if rc ~= 0 then
         error('cursor error')
     end
-    self.state = CUR_INITIALIZED
+    self.state = CUR_SEEKED
     local rc = lmdb.mdb_cursor_get(self, key, value, lmdb.MDB_GET_CURRENT)
     if rc == lmdb.MDB_NOTFOUND then return nil end
     if rc ~= 0 then

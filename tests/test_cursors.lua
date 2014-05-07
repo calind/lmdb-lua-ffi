@@ -51,7 +51,7 @@ describe("LMDB cursors", function()
         env:transaction(function(txn)
             local i, c =  50, txn:cursor()
             assert.equals(50, tonumber(tostring(c:seek(50))))
-            i = 51
+            i = 50
             for k,v in c:iter() do
                 assert.equals(k, tonumber(tostring(v)))
                 assert.equals(k,i)
