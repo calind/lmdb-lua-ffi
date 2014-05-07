@@ -406,16 +406,30 @@ function cursor:__newindex(k,v)
 end
 
 
-function cursor:iter()
+function cursor:iter(options)
     local i = 0
+    local _options = {
+        reverse = false,
+    }
+    if options then
+        _options = _.extend(_options, options)
+    end
+    options = _options
+
     return function()
-        i = i + 1
         local key, value = MDB_val(), MDB_val()
         local op = lmdb.MDB_NEXT
+        if options.reverse then
+            op = lmdb.MDB_PREV
+        end
         if self.state == CUR_UNINITIALIZED then
             self.state = CUR_INITIALIZED
             op = lmdb.MDB_FIRST
+            if options.reverse then
+                op = lmdb.MDB_LAST
+            end
         end
+
         local rc = lmdb.mdb_cursor_get(self, key, value, op)
         if rc == lmdb.MDB_NOTFOUND then return nil end
         if rc ~= 0 then
@@ -427,6 +441,33 @@ function cursor:iter()
         end
         return tostring(key), value
     end
+end
+
+function cursor:seek(key, range)
+    local key = self.db_options.integer_keys and MDB_int_val(key) or MDB_val(key)
+    local value = MDB_val()
+    self.state = CUR_UNINITIALIZED
+    local op = lmdb.MDB_SET
+    if range then
+        op = lmdb.MDB_SET_RANGE
+    end
+    local rc = lmdb.mdb_cursor_get(self, key, nil, op)
+    if rc == lmdb.MDB_NOTFOUND then return nil end
+    if rc ~= 0 then
+        error('cursor error')
+    end
+    self.state = CUR_INITIALIZED
+    local rc = lmdb.mdb_cursor_get(self, key, value, lmdb.MDB_GET_CURRENT)
+    if rc == lmdb.MDB_NOTFOUND then return nil end
+    if rc ~= 0 then
+        error('cursor error')
+    end
+
+    if self.db_options.integer_keys then
+        local key = ffi.cast('int32_t *', key.mv_data)
+        return tonumber(key[0]), value
+    end
+    return tostring(key), value
 end
 
 --

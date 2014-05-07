@@ -5,14 +5,16 @@ describe("LMDB cursors", function()
     local dump = utils.dump
     local testdb = './db/test-10k'
     local env, msg = nil
+    local intdb = nil
 
     setup(function()
         env, msg = lmdb.environment(testdb, {subdir = false, max_dbs=8})
+        intdb = env:db_open('int_db', {integer_keys = true})
         env:transaction(function(txn)
             for i=1,10000 do
                 txn:put(i,i)
             end
-        end, lmdb.WRITE)
+        end, lmdb.WRITE, intdb)
     end)
 
     teardown(function()
@@ -25,10 +27,63 @@ describe("LMDB cursors", function()
 
     it("checks cursor simple iteration", function()
         env:transaction(function(txn)
-            local i, c = 0, txn:cursor()
+            local i, c = 1, txn:cursor()
             for k,v in c:iter() do
-                assert.equals(k, tostring(v))
+                assert.equals(k, tonumber(tostring(v)))
+                assert.equals(k,i)
+                i = i + 1
             end
-        end, lmdb.READ_ONLY)
+        end, lmdb.READ_ONLY, intdb)
+    end)
+
+    it("checks cursor reverse iteration", function()
+        env:transaction(function(txn)
+            local i, c = 10000, txn:cursor()
+            for k,v in c:iter({reverse = true}) do
+                assert.equals(k, tonumber(tostring(v)))
+                assert.equals(k,i)
+                i = i - 1
+            end
+        end, lmdb.READ_ONLY, intdb)
+    end)
+
+    it("checks cursor seek", function()
+        env:transaction(function(txn)
+            local i, c =  50, txn:cursor()
+            assert.equals(50, tonumber(tostring(c:seek(50))))
+            i = 51
+            for k,v in c:iter() do
+                assert.equals(k, tonumber(tostring(v)))
+                assert.equals(k,i)
+                i = i + 1
+            end
+        end, lmdb.READ_ONLY, intdb)
+    end)
+
+    it("checks cursor seek not found", function()
+        env:transaction(function(txn)
+            local c = txn:cursor()
+            assert.is_nil(c:seek(10001))
+        end, lmdb.READ_ONLY, intdb)
+    end)
+
+    it("checks cursor iteration after seek not found", function()
+        env:transaction(function(txn)
+            local i, c =  1, txn:cursor()
+            assert.is_nil(c:seek(0))
+            for k,v in c:iter() do
+                assert.equals(k, tonumber(tostring(v)))
+                assert.equals(k,i)
+                i = i + 1
+            end
+        end, lmdb.READ_ONLY, intdb)
+    end)
+
+    it("checks cursor seek first found", function()
+        env:transaction(function(txn)
+            local c = txn:cursor()
+            local k,v = c:seek(0, true)
+            assert.equals(1, k)
+        end, lmdb.READ_ONLY, intdb)
     end)
 end)
