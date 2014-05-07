@@ -164,16 +164,23 @@ end
 function env:db_open(name, options, txn)
     local _options = {
         reverse_keys = false,
+        integer_keys = false,
         dupsort = false,
-        create = true,
-        integer_keys = false
+        create = true
     }
     -- print(self.db)
     if options then
         _options = _.extend(_options, options)
     end
     options = _options
-    local db =self.dbs[name or 0]
+    local db = nil
+    for k,v in pairs(self.dbs) do
+        if v.name == name then
+            db = v
+            break
+        end
+    end
+
     if db then
         for k,v in pairs(options) do
             if not db.options or db.options[k] ~= v then
@@ -185,7 +192,14 @@ function env:db_open(name, options, txn)
 
     local flags = 0
     if options.reverse_keys then flags = bit.bor(flags, lmdb.MDB_REVERSEKEY) end
-    if options.dupsort then flags = bit.bor(flags, lmdb.MDB_DUPSORT) end
+    if options.dupsort then
+        flags = bit.bor(flags, lmdb.MDB_DUPSORT)
+        if options.dupsort == 'integer' then
+            flags = bit.bor(flags, lmdb.MDB_INTEGERDUP)
+        elseif options.dupsort == 'reverse' then
+            flags = bit.bor(flags, lmdb.MDB_REVERSEDUP)
+        end
+    end
     if options.create then flags = bit.bor(flags, lmdb.MDB_CREATE) end
     if options.integer_keys then flags = bit.bor(flags, lmdb.MDB_INTEGERKEY) end
     local dbi = ffi.new 'MDB_dbi[1]'
@@ -201,8 +215,7 @@ function env:db_open(name, options, txn)
     if rc ~= 0 then
         return _error(rc)
     end
-    self.dbs[name or 0] = { _handle = dbi[0], options = options }
-    _data[dbi[0]] = options
+    self.dbs[dbi[0]] = { _handle = dbi[0], name = name, options = options }
     return dbi[0]
 end
 
@@ -220,7 +233,7 @@ function env:transaction(callback, write, db)
     ffi.gc(txn, txn.__gc)
     txn.read_only = (not write)
 
-    txn.db = db or (self.dbs[0] and self.dbs[0]._handle or nil)
+    txn.db = db or (self.dbs[1] and self.dbs[1]._handle or nil)
 
     txn.env = self
     callback(txn)
@@ -308,8 +321,7 @@ function txn:put(key, value, options, db)
         error("Transaction is read only.")
     end
     local db = db or self.db
-    local db_options = _data[db]
-
+    local db_options = self.env.dbs[db].options
     local _options = {
         dupdata = true,
         overwrite = true,
@@ -346,7 +358,7 @@ function txn:get(key, db)
     end
 
     local db = db or self.db
-    local db_options = _data[db]
+    local db_options = self.env.dbs[db].options
 
     local key = db_options.integer_keys and MDB_int_val(key) or MDB_val(key)
     local value = MDB_val()
@@ -384,7 +396,7 @@ end
 function txn:cursor(db)
     local cursor = ffi.new 'MDB_cursor *[1]';
     local db = db or self.db
-    local db_options = _data[db]
+    local db_options = self.env.dbs[db].options
 
     local rc = lmdb.mdb_cursor_open(self, db, cursor)
     if rc ~= 0 then
@@ -419,10 +431,12 @@ function cursor:iter(options)
 
     return function()
         local key, value = MDB_val(), MDB_val()
+
         local op = lmdb.MDB_NEXT
         if options.reverse then
             op = lmdb.MDB_PREV
         end
+
         if self.state == CUR_UNINITIALIZED then
             self.state = CUR_INITIALIZED
             op = lmdb.MDB_FIRST
@@ -553,7 +567,7 @@ function _M.environment(path, options)
 
     env.read_only = options.read_only
     env.dbs = {}
-    -- open and cache the default database
+    -- always open and cache the default database
     env:transaction(function(txn)
         db = env:db_open(nil,nil,txn)
     end,_M.READ_ONLY)

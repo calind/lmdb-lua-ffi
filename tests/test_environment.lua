@@ -23,7 +23,7 @@ describe("LMDB environment", function()
     it("checks for environment clean open", function()
         assert.is_nil(msg)
         assert.not_nil(env)
-        assert.not_nil(env['dbs'][0])
+        assert.not_nil(env['dbs'][1])
         assert.equals(testdb, env:path())
     end)
 

@@ -11,8 +11,8 @@ describe("LMDB cursors", function()
         env, msg = lmdb.environment(testdb, {subdir = false, max_dbs=8})
         intdb = env:db_open('int_db', {integer_keys = true})
         env:transaction(function(txn)
-            for i=1,10000 do
-                txn:put(i,i)
+            for i=1,100 do
+                txn:put(101 - i, 101 - i)
             end
         end, lmdb.WRITE, intdb)
     end)
@@ -38,7 +38,7 @@ describe("LMDB cursors", function()
 
     it("checks cursor reverse iteration", function()
         env:transaction(function(txn)
-            local i, c = 10000, txn:cursor()
+            local i, c = 100, txn:cursor()
             for k,v in c:iter({reverse = true}) do
                 assert.equals(k, tonumber(tostring(v)))
                 assert.equals(k,i)
@@ -63,7 +63,7 @@ describe("LMDB cursors", function()
     it("checks cursor seek not found", function()
         env:transaction(function(txn)
             local c = txn:cursor()
-            assert.is_nil(c:seek(10001))
+            assert.is_nil(c:seek(101))
         end, lmdb.READ_ONLY, intdb)
     end)
 
